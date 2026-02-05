@@ -1,22 +1,45 @@
 /**
  * NETOGREEN - Meta Showroom Reservation API
- * - Cloudflare Workers + D1
- * - Aligo Alimtalk (UE_6466/UE_6467/UE_6470) + failover SMS
- * - Resend email to paco@netogreenkr.com with .ics attachment
- * - Cron (scheduled) sends D-1 and D-day reminders
+ * Cloudflare Workers + D1
+ * - Aligo Alimtalk: UE_6466(확정), UE_6467(D-1), UE_6470(D-day), failover=Y 지원
+ * - Resend email to ADMIN_EMAIL_TO with .ics attachment
+ * - No SQL BEGIN/COMMIT (D1 제한 회피)
  */
 
+export interface Env {
+  DB: D1Database;
+
+  // Aligo (Secrets)
+  ALIGO_APIKEY: string;
+  ALIGO_USERID: string;
+  ALIGO_SENDERKEY: string;
+  ALIGO_SENDER: string;
+
+  // Aligo (Variables)
+  ALIGO_TPL_CONFIRM: string; // UE_6466
+  ALIGO_TPL_D1: string;      // UE_6467
+  ALIGO_TPL_D0: string;      // UE_6470
+  ALIGO_FAILOVER?: string;   // "Y" or "N"
+
+  // Resend (Secrets)
+  RESEND_API_KEY: string;
+  RESEND_FROM: string;       // verified sender
+
+  // Resend (Variables)
+  ADMIN_EMAIL_TO?: string;   // paco@netogreenkr.com
+}
+
 export default {
-  async fetch(request, env) {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // CORS (원하면 Firebase 도메인으로 제한 가능)
-    const cors = {
+    const cors: Record<string, string> = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type",
     };
+
     if (request.method === "OPTIONS") return new Response(null, { headers: cors });
 
     try {
@@ -42,19 +65,19 @@ export default {
       }
 
       if (path === "/api/reserve" && request.method === "POST") {
-        const body = await request.json().catch(() => ({}));
+        const body: any = await request.json().catch(() => ({}));
 
         const date = body?.date;
         const time = body?.time;
-        const name = (body?.name || "").trim();
+        const name = String(body?.name || "").trim();
         const phone = digitsOnly(body?.phone || "");
         const password = String(body?.password || "").trim();
-        const landAddress = (body?.landAddress || "").trim();
-        const notes = (body?.notes || "").trim();
+        const landAddress = String(body?.landAddress || "").trim();
+        const notes = String(body?.notes || "").trim();
 
-        const utm_source = (body?.utm_source || "").trim();
-        const utm_medium = (body?.utm_medium || "").trim();
-        const utm_campaign = (body?.utm_campaign || "").trim();
+        const utm_source = String(body?.utm_source || "").trim();
+        const utm_medium = String(body?.utm_medium || "").trim();
+        const utm_campaign = String(body?.utm_campaign || "").trim();
 
         if (!isYMD(date)) return json({ error: "invalid date" }, cors, 400);
         if (!isHM(time)) return json({ error: "invalid time" }, cors, 400);
@@ -68,33 +91,28 @@ export default {
         const id = crypto.randomUUID();
         const createdAt = new Date().toISOString();
 
-        // 1) DB insert (중복 예약 차단: unique index)
+        // ✅ D1: SQL BEGIN/COMMIT 금지 → 단일 INSERT만 수행
         try {
-          await env.DB.batch([
-            env.DB.prepare("BEGIN"),
-            env.DB.prepare(
-              `INSERT INTO reservations
-               (id, created_at, source, utm_source, utm_medium, utm_campaign,
-                date, time, name, phone, password, land_address, notes, status)
-               VALUES (?, ?, 'meta', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'booked')`
-            ).bind(
-              id,
-              createdAt,
-              emptyToNull(utm_source),
-              emptyToNull(utm_medium),
-              emptyToNull(utm_campaign),
-              date,
-              time,
-              name,
-              phone,
-              password,
-              emptyToNull(landAddress),
-              emptyToNull(notes)
-            ),
-            env.DB.prepare("COMMIT"),
-          ]);
-        } catch (e) {
-          try { await env.DB.prepare("ROLLBACK").run(); } catch {}
+          await env.DB.prepare(
+            `INSERT INTO reservations
+             (id, created_at, source, utm_source, utm_medium, utm_campaign,
+              date, time, name, phone, password, land_address, notes, status)
+             VALUES (?, ?, 'meta', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'booked')`
+          ).bind(
+            id,
+            createdAt,
+            emptyToNull(utm_source),
+            emptyToNull(utm_medium),
+            emptyToNull(utm_campaign),
+            date,
+            time,
+            name,
+            phone,
+            password,
+            emptyToNull(landAddress),
+            emptyToNull(notes)
+          ).run();
+        } catch (e: any) {
           const msg = String(e?.message || e);
           if (msg.toLowerCase().includes("unique") || msg.toLowerCase().includes("constraint")) {
             return json({ error: "already booked" }, cors, 409);
@@ -102,25 +120,25 @@ export default {
           return json({ error: "db error", detail: msg }, cors, 500);
         }
 
-        // 2) 알림톡(확정) - 실패해도 예약은 유지
+        // 1) 알림톡(확정) - 실패해도 예약 유지
         try {
           await sendConfirmAlimtalk(env, { name, phone, date, time });
           await env.DB.prepare(
             `UPDATE reservations SET notify_confirm_at=?, notify_last_error=NULL WHERE id=?`
           ).bind(new Date().toISOString(), id).run();
-        } catch (e) {
+        } catch (e: any) {
           await env.DB.prepare(
             `UPDATE reservations SET notify_last_error=? WHERE id=?`
           ).bind(String(e?.message || e), id).run();
         }
 
-        // 3) 관리자 메일(Resend + ICS) - 실패해도 예약은 유지
+        // 2) 관리자 메일(Resend+ICS) - 실패해도 예약 유지
         try {
           await sendAdminEmailWithICS(env, { id, date, time, name, phone, landAddress, notes });
           await env.DB.prepare(
             `UPDATE reservations SET email_sent_at=?, email_last_error=NULL WHERE id=?`
           ).bind(new Date().toISOString(), id).run();
-        } catch (e) {
+        } catch (e: any) {
           await env.DB.prepare(
             `UPDATE reservations SET email_last_error=? WHERE id=?`
           ).bind(String(e?.message || e), id).run();
@@ -130,9 +148,9 @@ export default {
       }
 
       if (path === "/api/my" && request.method === "GET") {
-        const name = (url.searchParams.get("name") || "").trim();
+        const name = String(url.searchParams.get("name") || "").trim();
         const phone = digitsOnly(url.searchParams.get("phone") || "");
-        const password = (url.searchParams.get("password") || "").trim();
+        const password = String(url.searchParams.get("password") || "").trim();
         if (!name || !phone || !password) return json({ error: "name/phone/password required" }, cors, 400);
 
         const rs = await env.DB.prepare(
@@ -147,9 +165,9 @@ export default {
       }
 
       if (path === "/api/cancel" && request.method === "POST") {
-        const body = await request.json().catch(() => ({}));
+        const body: any = await request.json().catch(() => ({}));
         const id = String(body?.id || "").trim();
-        const name = (body?.name || "").trim();
+        const name = String(body?.name || "").trim();
         const phone = digitsOnly(body?.phone || "");
         const password = String(body?.password || "").trim();
         if (!id || !name || !phone || !password) return json({ error: "id/name/phone/password required" }, cors, 400);
@@ -165,65 +183,72 @@ export default {
       }
 
       return json({ error: "not found" }, cors, 404);
-    } catch (e) {
+    } catch (e: any) {
       return json({ error: "server error", detail: String(e?.message || e) }, cors, 500);
     }
   },
 
   // Cron Triggers -> scheduled handler
-  async scheduled(event, env, ctx) {
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
     ctx.waitUntil(runReminders(env));
   },
 };
 
-/* -------------------- 공통 유틸 -------------------- */
-function json(obj, headers = {}, status = 200) {
+/* -------------------- Common utils -------------------- */
+
+function json(obj: any, headers: Record<string, string> = {}, status = 200): Response {
   return new Response(JSON.stringify(obj), {
     status,
     headers: { "Content-Type": "application/json; charset=utf-8", ...headers },
   });
 }
-function toInt(v) {
+
+function toInt(v: string | null): number | null {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 }
-function isYMD(s) {
+
+function isYMD(s: any): s is string {
   return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
 }
-function isHM(s) {
+
+function isHM(s: any): s is string {
   return typeof s === "string" && /^\d{2}:\d{2}$/.test(s);
 }
-function digitsOnly(s) {
+
+function digitsOnly(s: any): string {
   return String(s).replace(/\D/g, "");
 }
-function emptyToNull(v) {
+
+function emptyToNull(v: any): string | null {
   const s = String(v ?? "").trim();
   return s ? s : null;
 }
 
-/* -------------------- 예약 시간 규칙 -------------------- */
-/* 월~금: 13:00, 15:00 / 토: 14:00, 16:00 / 일: 없음 */
-function allowedTimesForDate(ymd) {
-  const d = new Date(`${ymd}T00:00:00Z`); // 날짜만 쓰므로 UTC로 충분
+/* -------------------- Time rules -------------------- */
+/* Mon-Fri: 13:00, 15:00 / Sat: 14:00, 16:00 / Sun: none */
+function allowedTimesForDate(ymd: string): string[] {
+  const d = new Date(`${ymd}T00:00:00Z`);
   const dow = d.getUTCDay(); // 0=Sun ... 6=Sat
   if (dow === 0) return [];
   if (dow === 6) return ["14:00", "16:00"];
   return ["13:00", "15:00"];
 }
-async function getClosedTimes(db, ymd) {
+
+async function getClosedTimes(db: D1Database, ymd: string): Promise<string[]> {
   const r = await db.prepare(
     `SELECT time FROM reservations WHERE date=? AND status='booked'`
   ).bind(ymd).all();
-  return (r.results || []).map((x) => x.time);
+  return (r.results || []).map((x: any) => x.time);
 }
 
-/* -------------------- 달력 생성(6주 42칸) -------------------- */
-async function buildCalendar(db, yyyy, mm) {
+/* -------------------- Calendar (6 weeks, 42 cells) -------------------- */
+async function buildCalendar(db: D1Database, yyyy: number, mm: number) {
   const first = new Date(Date.UTC(yyyy, mm - 1, 1));
   const start = new Date(first);
-  start.setUTCDate(first.getUTCDate() - first.getUTCDay()); // 그 주 일요일
+  start.setUTCDate(first.getUTCDate() - first.getUTCDay());
 
-  const cells = [];
+  const cells: any[] = [];
   for (let i = 0; i < 42; i++) {
     const cur = new Date(start);
     cur.setUTCDate(start.getUTCDate() + i);
@@ -257,21 +282,22 @@ async function buildCalendar(db, yyyy, mm) {
   };
 }
 
-/* -------------------- 알리고 알림톡 -------------------- */
-async function aligoGetToken(env) {
-  const url = "https://kakaoapi.aligo.in/akv10/token/create/30/s/";
+/* -------------------- Aligo Alimtalk -------------------- */
+
+async function aligoGetToken(env: Env): Promise<string> {
   const form = new URLSearchParams({ apikey: env.ALIGO_APIKEY, userid: env.ALIGO_USERID });
-  const res = await fetch(url, {
+  const res = await fetch("https://kakaoapi.aligo.in/akv10/token/create/30/s/", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: form,
   });
-  const data = await res.json().catch(() => ({}));
+  const data: any = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(`ALIGO token HTTP ${res.status}`);
   if (data.code !== 0 || !data.token) throw new Error(`ALIGO token fail: ${data.message || "unknown"}`);
   return data.token;
 }
-function fillVars(templateText, vars) {
+
+function fillVars(templateText: string, vars: Record<string, string>): string {
   let msg = templateText;
   for (const [k, v] of Object.entries(vars)) msg = msg.replaceAll(`#{${k}}`, String(v ?? ""));
   return msg;
@@ -326,7 +352,7 @@ const TPL_TEXT_D0 = `안녕하세요 #{고객명} 고객님
 
 - 무료 주차 가능`;
 
-async function aligoSendAlimtalk(env, { tpl_code, receiver, subject, message }) {
+async function aligoSendAlimtalk(env: Env, args: { tpl_code: string; receiver: string; subject: string; message: string; }) {
   const token = await aligoGetToken(env);
 
   const form = new URLSearchParams({
@@ -334,16 +360,14 @@ async function aligoSendAlimtalk(env, { tpl_code, receiver, subject, message }) 
     userid: env.ALIGO_USERID,
     token,
     senderkey: env.ALIGO_SENDERKEY,
-    tpl_code,
+    tpl_code: args.tpl_code,
     sender: env.ALIGO_SENDER,
-    receiver_1: receiver,
-    subject_1: subject,
-    message_1: message,
+    receiver_1: args.receiver,
+    subject_1: args.subject,
+    message_1: args.message,
   });
 
-  if ((env.ALIGO_FAILOVER || "").toUpperCase() === "Y") {
-    form.set("failover", "Y");
-  }
+  if ((env.ALIGO_FAILOVER || "").toUpperCase() === "Y") form.set("failover", "Y");
 
   const res = await fetch("https://kakaoapi.aligo.in/akv10/alimtalk/send/", {
     method: "POST",
@@ -351,49 +375,52 @@ async function aligoSendAlimtalk(env, { tpl_code, receiver, subject, message }) 
     body: form,
   });
 
-  const data = await res.json().catch(() => ({}));
+  const data: any = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(`ALIGO send HTTP ${res.status}`);
   if (data.code !== 0) throw new Error(`ALIGO send fail: ${data.message || "unknown"}`);
   return data;
 }
 
-async function sendConfirmAlimtalk(env, { name, phone, date, time }) {
-  const msg = fillVars(TPL_TEXT_CONFIRM, { "고객명": name, "예약일": date, "예약시": time });
+async function sendConfirmAlimtalk(env: Env, p: { name: string; phone: string; date: string; time: string; }) {
+  const msg = fillVars(TPL_TEXT_CONFIRM, { "고객명": p.name, "예약일": p.date, "예약시": p.time });
   await aligoSendAlimtalk(env, {
     tpl_code: env.ALIGO_TPL_CONFIRM,
-    receiver: phone,
+    receiver: p.phone,
     subject: "쇼룸 예약 확정",
     message: msg,
   });
 }
 
-async function sendReminderAlimtalk(env, { kind, name, phone, date, time }) {
-  const isD1 = kind === "D1";
+async function sendReminderAlimtalk(env: Env, p: { kind: "D1" | "D0"; name: string; phone: string; date: string; time: string; }) {
+  const isD1 = p.kind === "D1";
   const tpl = isD1 ? env.ALIGO_TPL_D1 : env.ALIGO_TPL_D0;
   const subject = isD1 ? "내일 쇼룸 방문 안내" : "오늘 쇼룸 방문 안내";
   const template = isD1 ? TPL_TEXT_D1 : TPL_TEXT_D0;
-
-  const msg = fillVars(template, { "고객명": name, "예약일": date, "예약시": time });
-  await aligoSendAlimtalk(env, { tpl_code: tpl, receiver: phone, subject, message: msg });
+  const msg = fillVars(template, { "고객명": p.name, "예약일": p.date, "예약시": p.time });
+  await aligoSendAlimtalk(env, { tpl_code: tpl, receiver: p.phone, subject, message: msg });
 }
 
-/* -------------------- Resend 메일 + ICS -------------------- */
-function escapeICS(s) {
+/* -------------------- Resend Email + ICS -------------------- */
+
+function escapeICS(s: string): string {
   return String(s || "")
     .replaceAll("\\", "\\\\")
     .replaceAll("\n", "\\n")
     .replaceAll(",", "\\,")
     .replaceAll(";", "\\;");
 }
-function toICSStampUTC(d) {
-  const pad = (n) => String(n).padStart(2, "0");
+
+function toICSStampUTC(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
 }
-function toLocalICS(d) {
-  const pad = (n) => String(n).padStart(2, "0");
+
+function toLocalICS(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}T${pad(d.getHours())}${pad(d.getMinutes())}00`;
 }
-function buildICS({ uid, title, startLocal, endLocal, location, description }) {
+
+function buildICS(args: { uid: string; title: string; startLocal: string; endLocal: string; location: string; description: string; }) {
   return [
     "BEGIN:VCALENDAR",
     "VERSION:2.0",
@@ -401,29 +428,29 @@ function buildICS({ uid, title, startLocal, endLocal, location, description }) {
     "CALSCALE:GREGORIAN",
     "METHOD:REQUEST",
     "BEGIN:VEVENT",
-    `UID:${uid}`,
+    `UID:${args.uid}`,
     `DTSTAMP:${toICSStampUTC(new Date())}`,
-    `DTSTART:${startLocal}`,
-    `DTEND:${endLocal}`,
-    `SUMMARY:${escapeICS(title)}`,
-    `LOCATION:${escapeICS(location)}`,
-    `DESCRIPTION:${escapeICS(description)}`,
+    `DTSTART:${args.startLocal}`,
+    `DTEND:${args.endLocal}`,
+    `SUMMARY:${escapeICS(args.title)}`,
+    `LOCATION:${escapeICS(args.location)}`,
+    `DESCRIPTION:${escapeICS(args.description)}`,
     "END:VEVENT",
     "END:VCALENDAR",
   ].join("\r\n");
 }
-function b64utf8(s) {
+
+function b64utf8(s: string): string {
   const bytes = new TextEncoder().encode(s);
   let bin = "";
   for (const b of bytes) bin += String.fromCharCode(b);
   return btoa(bin);
 }
 
-async function sendAdminEmailWithICS(env, booking) {
+async function sendAdminEmailWithICS(env: Env, booking: { id: string; date: string; time: string; name: string; phone: string; landAddress: string; notes: string; }) {
   const to = env.ADMIN_EMAIL_TO || "paco@netogreenkr.com";
-  const from = env.RESEND_FROM;
   if (!env.RESEND_API_KEY) throw new Error("missing RESEND_API_KEY");
-  if (!from) throw new Error("missing RESEND_FROM");
+  if (!env.RESEND_FROM) throw new Error("missing RESEND_FROM");
 
   const subject = `[META 쇼룸예약] ${booking.date} ${booking.time} / ${booking.name}`;
 
@@ -441,7 +468,7 @@ async function sendAdminEmailWithICS(env, booking) {
       <li><b>설치 희망 주소</b>: ${booking.landAddress || "-"}</li>
       <li><b>요청사항</b>: ${safeNotes}</li>
     </ul>
-    <p>이 메일에는 캘린더(.ics) 초대장이 첨부되어 있습니다.</p>
+    <p>캘린더(.ics) 초대장이 첨부되어 있습니다.</p>
   `;
 
   const start = new Date(`${booking.date}T${booking.time}:00+09:00`);
@@ -457,7 +484,7 @@ async function sendAdminEmailWithICS(env, booking) {
   });
 
   const payload = {
-    from,
+    from: env.RESEND_FROM,
     to: [to],
     subject,
     html,
@@ -485,11 +512,12 @@ async function sendAdminEmailWithICS(env, booking) {
   }
 }
 
-/* -------------------- Cron: D-1 / D-day 자동 발송 -------------------- */
-async function runReminders(env) {
-  // KST 기준 날짜 문자열 생성
+/* -------------------- Cron: D-1 / D-day reminders -------------------- */
+async function runReminders(env: Env) {
+  // KST 기준 날짜 계산 (UTC+9)
   const now = new Date();
   const kst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+
   const y = kst.getUTCFullYear();
   const m = String(kst.getUTCMonth() + 1).padStart(2, "0");
   const d = String(kst.getUTCDate()).padStart(2, "0");
@@ -505,21 +533,21 @@ async function runReminders(env) {
   await sendBatch(env, { date: today, kind: "D0", markCol: "notify_d0_at" });
 }
 
-async function sendBatch(env, { date, kind, markCol }) {
+async function sendBatch(env: Env, args: { date: string; kind: "D1" | "D0"; markCol: "notify_d1_at" | "notify_d0_at"; }) {
   const rows = await env.DB.prepare(
     `SELECT id, name, phone, date, time
      FROM reservations
-     WHERE status='booked' AND date=? AND ${markCol} IS NULL
+     WHERE status='booked' AND date=? AND ${args.markCol} IS NULL
      LIMIT 200`
-  ).bind(date).all();
+  ).bind(args.date).all();
 
-  for (const r of (rows.results || [])) {
+  for (const r of (rows.results || []) as any[]) {
     try {
-      await sendReminderAlimtalk(env, { kind, name: r.name, phone: r.phone, date: r.date, time: r.time });
+      await sendReminderAlimtalk(env, { kind: args.kind, name: r.name, phone: r.phone, date: r.date, time: r.time });
       await env.DB.prepare(
-        `UPDATE reservations SET ${markCol}=?, notify_last_error=NULL WHERE id=?`
+        `UPDATE reservations SET ${args.markCol}=?, notify_last_error=NULL WHERE id=?`
       ).bind(new Date().toISOString(), r.id).run();
-    } catch (e) {
+    } catch (e: any) {
       await env.DB.prepare(
         `UPDATE reservations SET notify_last_error=? WHERE id=?`
       ).bind(String(e?.message || e), r.id).run();
