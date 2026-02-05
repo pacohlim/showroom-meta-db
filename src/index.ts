@@ -45,7 +45,8 @@ export default {
     if (request.method === "OPTIONS") return new Response(null, { headers: cors });
 
     try {
-      if (path === "/api/health") return json({ ok: true }, cors);
+      if (path === "/api/health") return json({ ok: true, build: BUILD }, cors);
+
 
       if (path === "/api/calendar" && request.method === "GET") {
         const yyyy = toInt(url.searchParams.get("yyyy"));
