@@ -1,3 +1,5 @@
+const BUILD = "no-begin-2026-02-05-1";
+
 /**
  * NETOGREEN - Meta Showroom Reservation API
  * Cloudflare Workers + D1
